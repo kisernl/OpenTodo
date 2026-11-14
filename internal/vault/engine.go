@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -75,6 +76,9 @@ type Report struct {
 	// Projects and Tasks count what the vault holds after the sync.
 	Projects int `json:"projects"`
 	Tasks    int `json:"tasks"`
+	// Notes counts what the sync did to standalone notes; absent while the
+	// vault's notes are off (OpenSpec change vault-notes).
+	Notes *NoteCounts `json:"notes,omitempty"`
 	// Planned lists the ops a dry run would push; Files the files it would write.
 	Planned []Op     `json:"planned,omitempty"`
 	Files   []string `json:"files,omitempty"`
@@ -131,6 +135,18 @@ type engine struct {
 	// freshLines are the ids given to new lines, by file and by the line's
 	// text and its occurrence: a file saved during the run gets them still.
 	freshLines map[string]map[string]string
+	// sn is the run's standalone notes, nil while the vault's notes are off.
+	sn *standalone
+	// tsAt stamps single ops ("entity:id:field") with a timestamp of their own
+	// instead of the entity's: a note's body write (vault-notes D3).
+	tsAt map[string]int64
+}
+
+// newView is a view of s with the run's crypter, zone and Notes/ reservation.
+func (e *engine) newView(s Store, shared map[string]bool) *view {
+	v := newView(s, e.o.Crypter, e.o.Loc, shared)
+	v.notesDir = e.st.notesFence() != ""
+	return v
 }
 
 // Sync runs one sync of the vault in o.Dir.
@@ -156,6 +172,12 @@ func Sync(ctx context.Context, o Options) (*Report, error) {
 		st.takeOver()
 		takeOver = true
 	}
+	if st.Notes && !st.NotesSeeded && st.Cursor > 0 && !o.DryRun {
+		// Notes were turned on: pull once from the start for the notes the
+		// store skipped while they were off (vault-notes D5). Ops already in
+		// the store fold in again without changing anything.
+		st.Cursor, st.BackfillAck = 0, 0
+	}
 	base := st.Store
 	if len(st.Held) > 0 {
 		// Files saved during the last sync merge against what they were
@@ -175,7 +197,7 @@ func Sync(ctx context.Context, o Options) (*Report, error) {
 		base: base, app: st.Store.Clone(), startCursor: st.Cursor,
 		refused: map[string]bool{}, stamped: map[string]int64{}, conf: map[string][]string{},
 		bodies: map[string]map[string]map[string]any{}, fresh: map[string]bool{}, retouch: map[string]bool{},
-		raced: map[string]bool{}, racedTasks: map[string]bool{}, freshLines: map[string]map[string]string{}}
+		raced: map[string]bool{}, racedTasks: map[string]bool{}, freshLines: map[string]map[string]string{}, tsAt: map[string]int64{}}
 	e.clk = clock{st: st, now: o.Now}
 	if err := e.loadNotes(); err != nil {
 		return nil, err
@@ -186,12 +208,21 @@ func Sync(ctx context.Context, o Options) (*Report, error) {
 	if err := e.scanNotes(); err != nil {
 		return nil, err
 	}
+	if err := e.scanStandalone(); err != nil {
+		return nil, err
+	}
 	if err := e.pull(ctx); err != nil {
+		return nil, err
+	}
+	if err := e.checkNoteLimits(); err != nil {
 		return nil, err
 	}
 	e.matchNotes()
 	if !o.ReadOnly {
 		if err := e.merge(); err != nil {
+			return nil, err
+		}
+		if err := e.mergeStandalone(); err != nil {
 			return nil, err
 		}
 	}
@@ -210,11 +241,24 @@ func Sync(ctx context.Context, o Options) (*Report, error) {
 		if err := e.planNotes(true); err != nil {
 			return nil, err
 		}
+		if err := e.planStandalone(true); err != nil {
+			return nil, err
+		}
 		e.plan(true)
 		e.rep.Cursor = e.startCursor
 		return e.rep, nil
 	}
 	if !o.ReadOnly && len(e.ops) > 0 {
+		if testHookBeforePush != nil {
+			testHookBeforePush()
+		}
+		// A file read in the middle of a save (an editor's empty first step)
+		// must not turn into ops: re-read the files the merge used, and when
+		// one changed meanwhile push nothing, write nothing and keep the state,
+		// so the next sync reads the whole save.
+		if saved := e.savedSinceRead(); len(saved) > 0 {
+			return e.skippedReport(saved), nil
+		}
 		if err := e.push(ctx, e.ops); err != nil {
 			return nil, err
 		}
@@ -228,7 +272,11 @@ func Sync(ctx context.Context, o Options) (*Report, error) {
 		}
 		e.app.Apply(op)
 	}
+	e.staleNotes()
 	if err := e.planNotes(false); err != nil {
+		return nil, err
+	}
+	if err := e.planStandalone(false); err != nil {
 		return nil, err
 	}
 	if err := e.plan(false); err != nil {
@@ -236,6 +284,9 @@ func Sync(ctx context.Context, o Options) (*Report, error) {
 	}
 	e.saveBase()
 	st.Initialized = true
+	if st.Notes {
+		st.NotesSeeded = true
+	}
 	if o.Owner != nil {
 		owner := *o.Owner
 		st.Owner, st.LeaseUntil = &owner, o.Now().Add(Lease).UnixMilli()
@@ -282,9 +333,16 @@ func vaultFile(rel string) bool {
 	return true
 }
 
-// scanFiles reads every vault file of dir. fence is the slash path of a
-// linked TaskNotes folder below dir, never read as project files ("" none).
-func scanFiles(dir, fence string) (map[string][]byte, error) {
+// scanFiles reads every vault file of dir. fences are slash paths below dir
+// never read as project files: a linked TaskNotes folder, and Notes/ while
+// the vault's standalone notes are on ("" entries are ignored).
+func scanFiles(dir string, fences ...string) (map[string][]byte, error) {
+	fenced := map[string]bool{}
+	for _, f := range fences {
+		if f != "" {
+			fenced[f] = true
+		}
+	}
 	out := map[string][]byte{}
 	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -293,7 +351,7 @@ func scanFiles(dir, fence string) (map[string][]byte, error) {
 		rel, _ := filepath.Rel(dir, p)
 		rel = filepath.ToSlash(rel)
 		if d.IsDir() {
-			if rel != "." && (strings.HasPrefix(d.Name(), ".") || fence != "" && rel == fence) {
+			if rel != "." && (strings.HasPrefix(d.Name(), ".") || fenced[rel]) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -318,7 +376,7 @@ func (e *engine) scan() error {
 	if e.tn != nil {
 		fence = e.tn.fence
 	}
-	disk, err := scanFiles(e.o.Dir, fence)
+	disk, err := scanFiles(e.o.Dir, fence, e.st.notesFence())
 	if err != nil {
 		return err
 	}
@@ -359,6 +417,43 @@ func (e *engine) scan() error {
 		e.changed[p] = true
 	}
 	return nil
+}
+
+// savedSinceRead lists the files the merge read as changed that no longer
+// hold what it read: vault files, and standalone note files when notes are on.
+func (e *engine) savedSinceRead() []string {
+	var out []string
+	still := func(p string, read []byte) {
+		b, err := os.ReadFile(filepath.Join(e.o.Dir, filepath.FromSlash(p)))
+		if err != nil || !bytes.Equal(b, read) {
+			out = append(out, p)
+		}
+	}
+	for _, p := range sortedKeys(e.changed) {
+		still(p, e.disk[p])
+	}
+	if e.sn != nil {
+		recorded := map[string]string{}
+		for _, rec := range e.st.NoteFiles {
+			recorded[rec.Path] = rec.Hash
+		}
+		for _, p := range sortedKeys(e.sn.disk) {
+			if raw := e.sn.disk[p].raw; recorded[p] != hashOf(raw) {
+				still(p, raw)
+			}
+		}
+	}
+	return out
+}
+
+// skippedReport is the report of a sync that stopped before its push
+// because files were saved while it read them: nothing was sent or written.
+func (e *engine) skippedReport(saved []string) *Report {
+	rep := &Report{Warnings: e.rep.Warnings, Events: []Event{}, Cursor: e.startCursor}
+	for _, p := range saved {
+		rep.event("skipped", p, "", "skipped %s: it was saved while the sync read it; the next sync reads it", p)
+	}
+	return rep
 }
 
 // saveBase makes the app the new base, except for what a read-only run left
@@ -404,6 +499,7 @@ func (e *engine) saveBase() {
 	}
 	e.st.Store = next
 	e.holdRaced()
+	e.holdNoteBases()
 }
 
 // holdRaced keeps, for the next sync, the rows a file or task note saved
@@ -464,7 +560,7 @@ func ReadStatus(dir string) (*Status, error) {
 			fence = filepath.ToSlash(rel)
 		}
 	}
-	disk, err := scanFiles(dir, fence)
+	disk, err := scanFiles(dir, fence, st.notesFence())
 	if err != nil {
 		return nil, err
 	}
@@ -494,6 +590,9 @@ func ReadStatus(dir string) (*Status, error) {
 	})
 	if st.TaskNotes != nil {
 		notesStatus(dir, tnDir, fence, st.TaskNotes, out)
+	}
+	if st.notesFence() != "" {
+		standaloneStatus(dir, st, out)
 	}
 	sort.Strings(out.Changed)
 	sort.Strings(out.Missing)

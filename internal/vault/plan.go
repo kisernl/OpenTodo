@@ -28,6 +28,10 @@ func (e *engine) build() []Op {
 		}
 		ts := e.clk.next()
 		for _, f := range sortedKeys(b) {
+			ts := ts
+			if at, ok := e.tsAt[key+":"+f]; ok {
+				ts = at
+			}
 			raw := jsonOf(b[f])
 			base := e.base.Get(entity, id)[f]
 			idValue := []byte(raw)
@@ -60,7 +64,7 @@ func (e *engine) sealing(entity, id, field string, b map[string]any) bool {
 	switch entity {
 	case "project":
 		project = id
-	case "task", "section":
+	case "task", "section", "note":
 		project = e.app.Get(entity, id).Str("project_id")
 		if p, ok := b["project_id"].(string); ok {
 			project = p
@@ -154,7 +158,7 @@ func conflictName(p string) string { return strings.TrimSuffix(p, ".md") + ".con
 // plan prints the touched project files and writes, moves and removes files
 // (D3, D7, D8). A dry run only lists the files.
 func (e *engine) plan(dry bool) error {
-	v := newView(e.app, e.o.Crypter, e.o.Loc, e.sharedSet())
+	v := e.newView(e.app, e.sharedSet())
 	layout := v.Layout()
 	recorded := map[string]string{}
 	for p, fs := range e.st.Files {
@@ -369,6 +373,9 @@ func (e *engine) giveFreshIDs(p, full string) error {
 
 // testHookBeforeWrite runs right before a sync writes the vault's files.
 var testHookBeforeWrite func()
+
+// testHookBeforePush runs right before a sync pushes its ops.
+var testHookBeforePush func()
 
 // sourceOf is the file on disk that holds a project's lines: the file parsed
 // for it this run, else its recorded file, else the file at its new place.
